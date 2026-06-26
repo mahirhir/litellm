@@ -209,6 +209,44 @@ async def test_escalation_step1_fails_step2_blocks():
         litellm.callbacks = original_callbacks
 
 
+@pytest.mark.skipif(HTTPException is None, reason="fastapi not installed")
+@pytest.mark.asyncio
+async def test_block_carries_original_guardrail_exception():
+    """A blocking step must expose the guardrail's own raised exception on the
+    result so the caller can re-raise it verbatim, giving the policy path the
+    same response/trace as a direct guardrail attachment."""
+    guard = AlwaysFailGuardrail(guardrail_name="moderation-filter")
+
+    pipeline = GuardrailPipeline(
+        mode="pre_call",
+        steps=[
+            PipelineStep(
+                guardrail="moderation-filter", on_fail="block", on_pass="allow"
+            )
+        ],
+    )
+
+    original_callbacks = litellm.callbacks.copy()
+    litellm.callbacks = [guard]
+
+    try:
+        result = await PipelineExecutor.execute_steps(
+            steps=pipeline.steps,
+            mode=pipeline.mode,
+            data={"messages": [{"role": "user", "content": "bad content"}]},
+            user_api_key_dict=MagicMock(),
+            call_type="completion",
+            policy_name="content-safety",
+        )
+
+        assert result.terminal_action == "block"
+        assert isinstance(result.original_exception, HTTPException)
+        assert result.original_exception.status_code == 400
+        assert result.original_exception.detail == "Content policy violation"
+    finally:
+        litellm.callbacks = original_callbacks
+
+
 @pytest.mark.asyncio
 async def test_passthrough_guardrail_failure_can_pipeline_block():
     """

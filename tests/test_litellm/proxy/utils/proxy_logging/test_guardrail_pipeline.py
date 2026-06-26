@@ -358,6 +358,7 @@ async def test_maybe_execute_pipelines_blocks_on_block_terminal_action_raises(
     fake_result = MagicMock()
     fake_result.terminal_action = "block"
     fake_result.step_results = []
+    fake_result.original_exception = None
     data = {"metadata": {"_guardrail_pipelines": [("policy-1", pipeline)]}, "messages": [], "model": "m"}
 
     async def fake_execute_steps(**kwargs):
@@ -376,6 +377,42 @@ async def test_maybe_execute_pipelines_blocks_on_block_terminal_action_raises(
         )
 
 
+@pytest.mark.asyncio
+async def test_maybe_execute_pipelines_reraises_original_guardrail_exception(
+    proxy_logging, make_user_api_key_auth, monkeypatch
+):
+    """A policy-wrapped guardrail block must surface the guardrail's own
+    exception verbatim, identical to the direct-attachment path."""
+    pipeline = MagicMock()
+    pipeline.mode = "pre_call"
+    pipeline.steps = []
+    original = HTTPException(
+        status_code=400,
+        detail={"error": "Violated OpenAI moderation policy", "moderation_result": {"x": 1}},
+    )
+    fake_result = MagicMock()
+    fake_result.terminal_action = "block"
+    fake_result.step_results = []
+    fake_result.original_exception = original
+    data = {"metadata": {"_guardrail_pipelines": [("policy-1", pipeline)]}, "messages": [], "model": "m"}
+
+    async def fake_execute_steps(**kwargs):
+        return fake_result
+
+    monkeypatch.setattr(
+        "litellm.proxy.policy_engine.pipeline_executor.PipelineExecutor.execute_steps",
+        fake_execute_steps,
+    )
+    with pytest.raises(HTTPException) as info:
+        await proxy_logging._maybe_execute_pipelines(
+            data=data,
+            user_api_key_dict=make_user_api_key_auth(),
+            call_type="completion",
+            event_hook="pre_call",
+        )
+    assert info.value is original
+
+
 # ---------------------------------------------------------------------------
 # _handle_pipeline_result
 # ---------------------------------------------------------------------------
@@ -390,10 +427,11 @@ def test_handle_pipeline_result_allow_with_modifications():
     assert out == {"a": 1, "b": 2, "c": 3}
 
 
-def test_handle_pipeline_result_block_raises_http_exception():
+def test_handle_pipeline_result_block_falls_back_to_generic_when_no_exception():
     result = MagicMock()
     result.terminal_action = "block"
     result.step_results = []
+    result.original_exception = None
     with pytest.raises(HTTPException) as info:
         ProxyLogging._handle_pipeline_result(result=result, data={"model": "m"}, policy_name="p")
     detail = info.value.detail
@@ -407,6 +445,55 @@ def test_handle_pipeline_result_block_raises_http_exception():
         "error_type": "guardrail_pipeline_error",
         "policy": "p",
     }
+
+
+def test_handle_pipeline_result_block_reraises_original_guardrail_exception():
+    """The policy path must re-raise the guardrail's own exception untouched,
+    not wrap it in a generic ``guardrail_pipeline_error``; this is what makes
+    the response and trace span identical to the direct-attachment path."""
+    original = HTTPException(
+        status_code=400,
+        detail={
+            "error": "Violated OpenAI moderation policy",
+            "moderation_result": {"violated_categories": ["harassment"]},
+        },
+    )
+    result = MagicMock()
+    result.terminal_action = "block"
+    result.step_results = []
+    result.original_exception = original
+    with pytest.raises(HTTPException) as info:
+        ProxyLogging._handle_pipeline_result(result=result, data={"model": "m"}, policy_name="p")
+    assert info.value is original
+    assert info.value.detail == {
+        "error": "Violated OpenAI moderation policy",
+        "moderation_result": {"violated_categories": ["harassment"]},
+    }
+
+
+def test_handle_pipeline_result_block_enriches_with_guardrail_name_and_mode():
+    """The re-raised exception must gain the blocking guardrail's name and mode,
+    matching the enrichment the direct-attachment path applies."""
+    cb = _make_guardrail()  # guardrail_name="g", event_hook=pre_call
+    original = HTTPException(status_code=400, detail={"error": "blocked"})
+    result = MagicMock()
+    result.terminal_action = "block"
+    result.step_results = [MagicMock(guardrail_name="g")]
+    result.original_exception = original
+
+    saved = litellm.callbacks
+    litellm.callbacks = [cb]
+    try:
+        with pytest.raises(HTTPException) as info:
+            ProxyLogging._handle_pipeline_result(
+                result=result, data={"model": "m"}, policy_name="p"
+            )
+    finally:
+        litellm.callbacks = saved
+
+    assert info.value is original
+    assert info.value.detail["guardrail_name"] == "g"
+    assert info.value.detail["guardrail_mode"] == GuardrailEventHooks.pre_call
 
 
 def test_handle_pipeline_result_modify_response_raises_modify_exception():

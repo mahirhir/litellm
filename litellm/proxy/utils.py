@@ -1356,7 +1356,7 @@ class ProxyLogging:
 
     @staticmethod
     def _handle_pipeline_result(
-        result: Any,
+        result: PipelineExecutionResult,
         data: dict,
         policy_name: str,
     ) -> dict:
@@ -1371,6 +1371,18 @@ class ProxyLogging:
             return data
 
         if result.terminal_action == "block":
+            if result.original_exception is not None:
+                blocking_step = result.step_results[-1] if result.step_results else None
+                if blocking_step is not None:
+                    callback = PipelineExecutor._find_guardrail_callback(
+                        blocking_step.guardrail_name
+                    )
+                    if callback is not None:
+                        _enrich_http_exception_with_guardrail_context(
+                            result.original_exception, callback
+                        )
+                raise result.original_exception
+
             step_results_serializable = [
                 {
                     "guardrail": sr.guardrail_name,
